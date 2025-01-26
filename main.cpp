@@ -1,4 +1,4 @@
-#include<glad/glad.h>
+#include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -6,6 +6,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <set>
 #include <sstream>
 
 // Shader sources
@@ -27,19 +28,28 @@ void main() {
 }
 )glsl";
 
+const char* outlineFragmentShader = R"glsl(
+#version 330 core
+out vec4 FragColor;
+void main() {
+    FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+}
+)glsl";
+
 struct Mesh {
     std::vector<float> vertices;
     std::vector<unsigned int> indices;
+    std::vector<unsigned int> edgeIndices;
     glm::vec3 color;
 };
 
-Mesh loadOBJ(const char* objPath, const char* mtlPath) {
+Mesh loadOBJ(const char* path) {
     Mesh mesh;
-    std::ifstream objFile(objPath);
+    std::ifstream file(path);
     std::string line;
+    std::set<std::pair<unsigned int, unsigned int>> edges;
 
-    // Parse OBJ vertices
-    while (std::getline(objFile, line)) {
+    while (std::getline(file, line)) {
         if (line.substr(0, 2) == "v ") {
             std::istringstream ss(line.substr(2));
             float x, y, z;
@@ -48,25 +58,40 @@ Mesh loadOBJ(const char* objPath, const char* mtlPath) {
         }
         else if (line.substr(0, 2) == "f ") {
             std::istringstream ss(line.substr(2));
-            unsigned int a, b, c;
-            ss >> a >> b >> c;
-            mesh.indices.insert(mesh.indices.end(), { a - 1, b - 1, c - 1 });
+            std::string token;
+            std::vector<unsigned int> face;
+
+            while (ss >> token) {
+                // Handle format like "f v1/vt1/vn1 v2/vt2/vn2 ..."
+                size_t pos = token.find('/');
+                if (pos != std::string::npos) {
+                    token = token.substr(0, pos);
+                }
+                face.push_back(std::stoul(token) - 1); // Convert to 0-based
+            }
+
+            // Add triangle indices
+            if (face.size() >= 3) {
+                mesh.indices.insert(mesh.indices.end(), { face[0], face[1], face[2] });
+            }
+
+            // Create edges
+            for (size_t i = 0; i < face.size(); i++) {
+                unsigned int a = face[i];
+                unsigned int b = face[(i + 1) % face.size()];
+                if (a > b) std::swap(a, b);
+                edges.insert({ a, b });
+            }
         }
     }
 
-    // Parse MTL color
-    std::ifstream mtlFile(mtlPath);
-    bool isBlueMaterial = false;
-    while (std::getline(mtlFile, line)) {
-        if (line.substr(0, 7) == "newmtl ") {
-            isBlueMaterial = (line.substr(7) == "Blue");
-        }
-        else if (isBlueMaterial && line.substr(0, 3) == "Kd ") {
-            std::istringstream ss(line.substr(3));
-            ss >> mesh.color.r >> mesh.color.g >> mesh.color.b;
-        }
+    // Convert edges to index array
+    for (auto& edge : edges) {
+        mesh.edgeIndices.push_back(edge.first);
+        mesh.edgeIndices.push_back(edge.second);
     }
 
+    mesh.color = glm::vec3(0.0f, 0.0f, 1.0f);
     return mesh;
 }
 
@@ -80,7 +105,7 @@ unsigned int compileShader(unsigned int type, const char* source) {
     if (!success) {
         char infoLog[512];
         glGetShaderInfoLog(id, 512, nullptr, infoLog);
-        std::cerr << "Shader compilation error:\n" << infoLog << std::endl;
+        std::cerr << "Shader error:\n" << infoLog << std::endl;
     }
     return id;
 }
@@ -93,7 +118,14 @@ unsigned int createShaderProgram(const char* vertexSource, const char* fragmentS
     glAttachShader(program, vs);
     glAttachShader(program, fs);
     glLinkProgram(program);
-    glValidateProgram(program);
+
+    int success;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetProgramInfoLog(program, 512, nullptr, infoLog);
+        std::cerr << "Program linking error:\n" << infoLog << std::endl;
+    }
 
     glDeleteShader(vs);
     glDeleteShader(fs);
@@ -108,87 +140,95 @@ int main() {
         return -1;
     }
 
-    // Configure GLFW
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    // Create window
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Blue Prism", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(800, 600, "Blue Prism Outline", nullptr, nullptr);
     if (!window) {
-        std::cerr << "Failed to create GLFW window" << std::endl;
+        std::cerr << "Failed to create window" << std::endl;
         glfwTerminate();
         return -1;
     }
     glfwMakeContextCurrent(window);
 
-    // Initialize GLEW
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         std::cerr << "Failed to initialize GLAD" << std::endl;
         return -1;
     }
 
     // Load mesh data
-    Mesh mesh = loadOBJ("prism.obj", "prism.mtl");
+    Mesh mesh = loadOBJ("prism.obj");
 
-    // Create VAO, VBO, and EBO
-    unsigned int VAO, VBO, EBO;
+    // Create and bind buffers
+    unsigned int VAO, VBO, EBO, edgeEBO;
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
     glGenBuffers(1, &EBO);
+    glGenBuffers(1, &edgeEBO);
 
     glBindVertexArray(VAO);
 
+    // Vertex buffer
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
     glBufferData(GL_ARRAY_BUFFER, mesh.vertices.size() * sizeof(float), mesh.vertices.data(), GL_STATIC_DRAW);
 
+    // Main element buffer
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.indices.size() * sizeof(unsigned int), mesh.indices.data(), GL_STATIC_DRAW);
+
+    // Edge element buffer
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, edgeEBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.edgeIndices.size() * sizeof(unsigned int), mesh.edgeIndices.data(), GL_STATIC_DRAW);
 
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    // Create shader program
-    unsigned int shaderProgram = createShaderProgram(vertexShaderSource, fragmentShaderSource);
-    glUseProgram(shaderProgram);
+    // Create shaders
+    unsigned int mainShader = createShaderProgram(vertexShaderSource, fragmentShaderSource);
+    unsigned int outlineShader = createShaderProgram(vertexShaderSource, outlineFragmentShader);
 
-    // Enable depth testing
     glEnable(GL_DEPTH_TEST);
 
-    // Main loop
     while (!glfwWindowShouldClose(window)) {
-        // Clear screen
-        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Create transformation matrices
+        // Set up transformation matrices
         glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f / 600.0f, 0.1f, 100.0f);
         glm::mat4 view = glm::lookAt(
-            glm::vec3(4, 3, 3), // Camera position
-            glm::vec3(0, 0, 0), // Look at point
-            glm::vec3(0, 1, 0)  // Up vector
+            glm::vec3(3, 2, 3),
+            glm::vec3(0, 0, 0),
+            glm::vec3(0, 1, 0)
         );
         glm::mat4 model = glm::mat4(1.0f);
         glm::mat4 mvp = projection * view * model;
 
-        // Set uniforms
-        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "mvp"), 1, GL_FALSE, glm::value_ptr(mvp));
-        glUniform3fv(glGetUniformLocation(shaderProgram, "color"), 1, &mesh.color[0]);
-
-        // Draw mesh
+        // Draw main prism
+        glUseProgram(mainShader);
+        glUniformMatrix4fv(glGetUniformLocation(mainShader, "mvp"), 1, GL_FALSE, glm::value_ptr(mvp));
+        glUniform3fv(glGetUniformLocation(mainShader, "color"), 1, &mesh.color[0]);
         glBindVertexArray(VAO);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
         glDrawElements(GL_TRIANGLES, mesh.indices.size(), GL_UNSIGNED_INT, 0);
 
-        // Swap buffers and poll events
+        // Draw outline
+        glUseProgram(outlineShader);
+        glUniformMatrix4fv(glGetUniformLocation(outlineShader, "mvp"), 1, GL_FALSE, glm::value_ptr(mvp));
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, edgeEBO);
+        glLineWidth(3.0f);
+        glDrawElements(GL_LINES, mesh.edgeIndices.size(), GL_UNSIGNED_INT, 0);
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-    // Cleanup
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
     glDeleteBuffers(1, &EBO);
-    glDeleteProgram(shaderProgram);
+    glDeleteBuffers(1, &edgeEBO);
+    glDeleteProgram(mainShader);
+    glDeleteProgram(outlineShader);
 
     glfwTerminate();
     return 0;
